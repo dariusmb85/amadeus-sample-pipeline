@@ -13,15 +13,28 @@
 # See README.md for workarounds, known issues, and auth setup.
 
 suppressPackageStartupMessages({
-  if (!requireNamespace("here",   quietly = TRUE)) install.packages("here")
-  if (!requireNamespace("fs",     quietly = TRUE)) install.packages("fs")
-  if (!requireNamespace("dotenv", quietly = TRUE)) install.packages("dotenv")
+  if (!requireNamespace("here",    quietly = TRUE)) install.packages("here")
+  if (!requireNamespace("fs",      quietly = TRUE)) install.packages("fs")
+  if (!requireNamespace("dotenv",  quietly = TRUE)) install.packages("dotenv")
+  if (!requireNamespace("amadeus", quietly = TRUE)) stop("Install amadeus first (see README.md)")
   library(here)
   library(fs)
 })
 
-# Load .env for NASA_EARTHDATA_TOKEN etc.
-if (file.exists(here(".env"))) dotenv::load_dot_env(here(".env"))
+# NASA Earthdata token — see README.md "Auth setup".
+# Prefer a token already persisted via `amadeus::setup_nasa_token(method = "renviron")`
+# (loaded automatically into the environment when R starts). Otherwise fall back to
+# this repo's gitignored .env file, registering it for the session via amadeus's own
+# setup_nasa_token(method = "session") rather than setting Sys.setenv() directly.
+if (!nzchar(Sys.getenv("NASA_EARTHDATA_TOKEN"))) {
+  if (file.exists(here(".env"))) {
+    dotenv::load_dot_env(here(".env"))
+    env_token <- trimws(Sys.getenv("NASA_EARTHDATA_TOKEN", ""))
+    if (nzchar(env_token)) amadeus::setup_nasa_token(method = "session", token = env_token)
+  } else if (interactive()) {
+    amadeus::setup_nasa_token()  # prompts and stores to ~/.Renviron
+  }
+}
 
 suppressPackageStartupMessages({
   library(amadeus)
@@ -386,7 +399,406 @@ run_source("TRI", {
 })
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 9. HUC watersheds — large download (~7GB); skip with documentation
+# 9. Population — NASA SEDAC gridded population density (GPWv4)
+#    Use 2.5 arc-minute resolution: the default 30 arc-second is a multi-GB
+#    global GeoTIFF; 2.5 arc-minute is ~47MB and plenty for ZCTA-scale joins.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("Population", {
+  dl_dir <- subdir("population")
+
+  try_download("download_population",
+    data_resolution   = "2.5 minute",
+    data_format       = "GeoTIFF",
+    year              = "2020",
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  tif <- list.files(fs::path(dl_dir, "data_files"), pattern = "\\.tif$", full.names = TRUE)
+  cov <- process_population(path = tif, extent = or_bbox)
+
+  calculate_population(
+    from    = cov,
+    locs    = or_pts,
+    locs_id = LOCS_ID,
+    radius  = 0,
+    fun     = "mean",
+    geom    = "sf"
+  )
+}, auth_required = TRUE)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. gROADS — NASA SEDAC Global Roads Open Access Data Set
+#     NOTE: an earlier version of this script skipped gROADS assuming it hit
+#     the same GES DISC Bearer-token wall as MERRA-2 (see section 21 below).
+#     That assumption was never tested. gROADS is SEDAC-hosted, not GES
+#     DISC-hosted, and downloads fine with the same NASA_EARTHDATA_TOKEN.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("gROADS", {
+  dl_dir <- subdir("groads")
+
+  try_download("download_groads",
+    data_region       = "Americas",
+    data_format       = "Shapefile",
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  shp <- list.files(fs::path(dl_dir, "data_files"), pattern = "\\.shp$",
+                     full.names = TRUE, recursive = TRUE)
+  cov <- process_groads(path = shp, extent = or_bbox)
+
+  # Roads are line features — a 0m point buffer always returns zero length.
+  # Use a 1km buffer (the function default) to get nonzero road density.
+  calculate_groads(
+    from    = cov,
+    locs    = or_pts,
+    locs_id = LOCS_ID,
+    radius  = 1000,
+    fun     = "sum",
+    geom    = "sf"
+  )
+}, auth_required = TRUE)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. GOES ADP — NOAA GOES-16 Aerosol Detection Product (Smoke)
+#     Uses the same wildfire smoke day as HMS (2021-08-17) as a natural
+#     cross-check: continuous satellite-detected smoke fraction vs. HMS's
+#     binary intensity categories.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("GOES", {
+  dl_dir     <- subdir("goes")
+  GOES_DATE  <- "2021-08-17"
+
+  try_download("download_goes",
+    date              = GOES_DATE,
+    satellite         = "16",
+    product           = "ADP-C",
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  cov <- process_goes(
+    date      = c(GOES_DATE, GOES_DATE),
+    variable  = "Smoke",
+    path      = dl_dir,
+    extent    = or_bbox,
+    daily_agg = TRUE,
+    fun       = "mean"
+  )
+
+  calculate_goes(
+    from    = cov,
+    locs    = or_pts,
+    locs_id = LOCS_ID,
+    radius  = 0,
+    fun     = "mean",
+    geom    = "sf"
+  )
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. NEI — EPA National Emissions Inventory (onroad emissions, county-level)
+#     Workaround: calculate_nei() preserves every column of `locs` verbatim
+#     (unlike other calculate_* functions, which subset to locs_id/time/value).
+#     Pass only the ID column to avoid carrying tigris ZCTA metadata columns
+#     (STATEFP10, GEOID10, ALAND10, ...) into the result.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("NEI", {
+  dl_dir <- subdir("nei")
+
+  try_download("download_nei",
+    year              = 2020L,
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  or_counties <- tigris::counties(state = "OR", year = 2020)
+  cov <- process_nei(path = fs::path(dl_dir, "data_files"), county = or_counties, year = 2020L)
+
+  calculate_nei(
+    from    = cov,
+    locs    = or_pts[, LOCS_ID],
+    locs_id = LOCS_ID,
+    geom    = "sf"
+  )
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. Drought indices — SPEI (monthly), EDDI (weekly), USDM (weekly polygons)
+#     Three sources share one download_drought()/process_drought() API but
+#     return different object types, so each gets its own run_source() call.
+# ═══════════════════════════════════════════════════════════════════════════════
+DR_START <- "2020-06-01"
+DR_END   <- "2020-06-30"
+
+run_source("Drought-SPEI", {
+  dl_dir <- subdir("drought_spei")
+
+  try_download("download_drought",
+    source            = "spei",
+    date              = c(DR_START, DR_END),
+    timescale         = 1L,
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE
+  )
+
+  # SPEI ships as one global multi-year file (spei01.nc, ~365MB); date only
+  # selects which layer(s) process_drought() returns, not what's downloaded.
+  cov <- process_drought(source = "spei", path = dl_dir, date = c(DR_START, DR_END),
+                          timescale = 1L, extent = or_bbox)
+
+  calculate_drought(from = cov, locs = or_pts, locs_id = LOCS_ID, radius = 0L,
+                     fun = "mean", geom = "sf")
+})
+
+run_source("Drought-EDDI", {
+  dl_dir <- subdir("drought_eddi")
+
+  try_download("download_drought",
+    source            = "eddi",
+    date              = c(DR_START, DR_END),
+    timescale         = 1L,
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE
+  )
+
+  cov <- process_drought(source = "eddi", path = dl_dir, date = c(DR_START, DR_END),
+                          timescale = 1L, extent = or_bbox)
+
+  calculate_drought(from = cov, locs = or_pts, locs_id = LOCS_ID, radius = 0L,
+                     fun = "mean", geom = "sf")
+})
+
+run_source("Drought-USDM", {
+  dl_dir <- subdir("drought_usdm")
+
+  try_download("download_drought",
+    source            = "usdm",
+    date              = c(DR_START, DR_END),
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE
+  )
+
+  cov <- process_drought(source = "usdm", path = dl_dir, date = c(DR_START, DR_END), extent = or_bbox)
+
+  calculate_drought(from = cov, locs = or_pts, locs_id = LOCS_ID, radius = 0L, geom = "sf")
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 14. Ecoregion — EPA Level III Ecoregions
+#     Workaround: process_ecoregion() keeps the shapefile's native Albers
+#     Equal Area projected CRS. Passing a lon/lat `extent` (as used for every
+#     other raster source in this script) gets silently misapplied in
+#     projected units, cropping the layer to nothing (0/419 locations
+#     matched). Skip `extent` here — calculate_ecoregion() reprojects the
+#     input locations to match `from`'s CRS internally, so it works without it.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("Ecoregion", {
+  dl_dir <- subdir("ecoregion")
+
+  try_download("download_ecoregion",
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  shp <- list.files(fs::path(dl_dir, "data_files"), pattern = "\\.shp$",
+                     full.names = TRUE, recursive = TRUE)
+  cov <- process_ecoregion(path = shp)
+
+  # geom = "sf" here produces a duplicated geometry.x/geometry.y artifact
+  # rather than real geometry; use geom = FALSE (a plain data.frame join works
+  # fine for the run_source() variable summary below).
+  calculate_ecoregion(from = cov, locs = or_pts, locs_id = LOCS_ID, geom = FALSE)
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. NARR — NOAA North American Regional Reanalysis (daily snow depth, weasd)
+#     Same CRS gotcha as Ecoregion: process_narr() keeps the native Lambert
+#     Conformal Conic grid, and a lon/lat `extent` gets misapplied in
+#     projected meters — the crop collapses to a ~32km box near the grid
+#     origin and every extracted value comes back 0/NA. Skip `extent` at
+#     process time; calculate_narr() reprojects locations correctly.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("NARR", {
+  dl_dir <- subdir("narr")
+
+  try_download("download_narr",
+    variables         = "weasd",
+    year              = 2022,
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  cov <- process_narr(date = c("2022-01-01", "2022-01-05"), variable = "weasd", path = dl_dir)
+
+  calculate_narr(from = cov, locs = or_pts, locs_id = LOCS_ID, radius = 0,
+                 fun = "mean", geom = "sf")
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. EDGAR — global emissions inventory (PM2.5, yearly totals)
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("EDGAR", {
+  dl_dir <- subdir("edgar")
+
+  try_download("download_edgar",
+    species           = "PM2.5",
+    version           = "8.1",
+    temp_res          = "yearly",
+    format            = "nc",
+    output            = "emi",
+    year_range        = 2020,
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  nc_file <- list.files(fs::path(dl_dir, "data_files"), pattern = "\\.nc$", full.names = TRUE)
+  cov <- process_edgar(path = nc_file, extent = or_bbox)
+
+  calculate_edgar(from = cov, locs = or_pts, locs_id = LOCS_ID, radius = 0,
+                   fun = "mean", geom = "sf")
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. AQS — EPA Air Quality System (PM2.5 daily monitors)
+#     No calculate_aqs() exists in amadeus: AQS is monitoring-station point
+#     data meant as a dependent variable, not a spatial-join covariate.
+#     process_aqs() alone returns per-site daily measurements within extent.
+#     NOTE: process_aqs()'s extent order is (xmin, xmax, ymin, ymax) — NOT
+#     the (xmin, ymin, xmax, ymax) order of sf::st_bbox().
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("AQS", {
+  dl_dir <- subdir("aqs")
+
+  try_download("download_aqs",
+    parameter_code      = 88101,
+    resolution_temporal = "daily",
+    year                = 2023,
+    directory_to_save   = dl_dir,
+    acknowledgement     = TRUE,
+    download            = TRUE
+  )
+
+  aqs_extent <- c(or_bbox["xmin"], or_bbox["xmax"], or_bbox["ymin"], or_bbox["ymax"])
+  process_aqs(
+    path          = fs::path(dl_dir, "data_files"),
+    date          = c("2023-08-15", "2023-08-15"),
+    mode          = "available-data",
+    return_format = "sf",
+    extent        = aqs_extent
+  )
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18. IMPROVE — aerosol monitoring at federal Class I areas
+#     No calculate_improve() exists in amadeus (same rationale as AQS).
+#     Workarounds:
+#     (a) download_improve() extracts .txt files directly into the save
+#         directory, not into a "data_files" subdirectory like other
+#         download_*() functions — pass the top-level dir to process_improve().
+#     (b) IMPROVE samples on a ~1-in-3-day cycle; a single arbitrary date
+#         often returns zero rows. Use a full month window instead.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("IMPROVE", {
+  dl_dir <- subdir("improve")
+
+  try_download("download_improve",
+    year              = 2020,
+    product           = "raw",
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  improve_extent <- c(or_bbox["xmin"], or_bbox["xmax"], or_bbox["ymin"], or_bbox["ymax"])
+  process_improve(
+    path          = dl_dir,
+    product       = "raw",
+    date          = c("2020-06-01", "2020-06-30"),
+    return_format = "sf",
+    extent        = improve_extent
+  )
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19. MODIS — MOD11A1 land surface temperature (Kelvin)
+#     Workarounds:
+#     (a) The `extent` argument order is (min_lon, min_lat, max_lon, max_lat)
+#         despite the amadeus docs describing it as (min_lon, max_lon,
+#         min_lat, max_lat) — verified against the function's own CONUS
+#         default value, which only makes sense in the former order.
+#     (b) calculate_modis() infers `date` from the downloaded HDF filenames
+#         itself; passing an explicit date= throws "formal argument matched
+#         by multiple actual arguments".
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("MODIS", {
+  dl_dir     <- subdir("modis")
+  MODIS_DATE <- "2023-08-15"
+  modis_extent <- c(or_bbox["xmin"], or_bbox["ymin"], or_bbox["xmax"], or_bbox["ymax"])
+
+  try_download("download_modis",
+    product           = "MOD11A1",
+    version           = "061",
+    date              = MODIS_DATE,
+    extent            = modis_extent,
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  hdf_files <- list.files(dl_dir, pattern = "\\.hdf$", full.names = TRUE, recursive = TRUE)
+
+  calculate_modis(
+    from            = hdf_files,
+    locs            = or_pts,
+    locs_id         = LOCS_ID,
+    radius          = 0,
+    subdataset      = "^LST_Day_1km$",
+    name_covariates = "MOD_LSTDY_",
+    scale           = "* 0.02",
+    geom            = "sf"
+  )
+}, auth_required = TRUE)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20. GEOS-CF — NASA atmospheric composition forecast (surface ozone, O3)
+#     GEOS-CF is served over OPeNDAP (opendap.nccs.nasa.gov), not GES DISC —
+#     the NASA_EARTHDATA_TOKEN Bearer auth that fails for MERRA-2 works fine
+#     here.
+#     Note: process_geos()'s `extent` argument does not crop the raster (it
+#     stays global, 721x1440); not fatal since calculate_geos() still
+#     extracts correctly at points, but the full global raster is held in
+#     memory during extraction.
+# ═══════════════════════════════════════════════════════════════════════════════
+run_source("GEOS-CF", {
+  dl_dir    <- subdir("geos")
+  GEOS_DATE <- "2023-08-15"
+
+  try_download("download_geos",
+    collection        = "aqc_tavg_1hr_g1440x721_v1",
+    date              = GEOS_DATE,
+    directory_to_save = dl_dir,
+    acknowledgement   = TRUE,
+    download          = TRUE
+  )
+
+  cov <- process_geos(date = c(GEOS_DATE, GEOS_DATE), variable = "O3", path = dl_dir,
+                       daily_agg = TRUE, fun = "mean")
+
+  calculate_geos(from = cov, locs = or_pts, locs_id = LOCS_ID, radius = 0,
+                  fun = "mean", geom = "sf")
+}, auth_required = TRUE)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 21. HUC watersheds — large download (~7GB); skip with documentation
 # ═══════════════════════════════════════════════════════════════════════════════
 cat("── HUC ──\n")
 cat("  [SKIP] NHDPlusV21 geodatabase is ~7GB; skip in discovery run.\n")
@@ -396,14 +808,16 @@ results[["HUC"]] <- list(status = "skipped",
                           msg    = "Download skipped (~7GB)")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 10. MERRA-2 / gROADS — require NASA EarthData credentials
+# 22. MERRA-2 — requires NASA EarthData credentials GES DISC does not accept
 #
 #     GES DISC (MERRA-2 host) uses ~/.netrc-based authentication:
 #       machine urs.earthdata.nasa.gov login <user> password <pass>
 #     amadeus::download_merra2() sends Authorization: Bearer <token>, which
 #     GES DISC does not accept — nc4 data files return 401 even with a valid
-#     token. These sources are skipped in local discovery runs; they should
-#     work on HPC where ~/.netrc is configured.
+#     token. This source is skipped in local discovery runs; it should
+#     work on HPC where ~/.netrc is configured. (gROADS was previously also
+#     skipped under this same assumption — see section 10 above; that
+#     assumption didn't hold, since gROADS is SEDAC-hosted, not GES DISC.)
 # ═══════════════════════════════════════════════════════════════════════════════
 cat("── MERRA-2 ──\n")
 cat("  [SKIP] GES DISC requires ~/.netrc auth; Bearer token not accepted for nc4 files.\n")
@@ -412,11 +826,17 @@ results[["MERRA-2"]] <- list(status = "skipped",
                               vars   = c("T2M_0", "..."),
                               msg    = "GES DISC requires ~/.netrc auth (Bearer token rejected)")
 
-cat("── gROADS ──\n")
-cat("  [SKIP] Same GES DISC auth issue as MERRA-2.\n\n")
-results[["gROADS"]] <- list(status = "skipped",
-                             vars   = character(0),
-                             msg    = "GES DISC requires ~/.netrc auth")
+# ═══════════════════════════════════════════════════════════════════════════════
+# 23. CropScape — USDA Cropland Data Layer; skipped, too large (~10.4GB/year)
+#     A single national year (zip + full-res tif + overview file) tested at
+#     10.4GB — larger than any other source in this script, including GMTED
+#     (7.4GB). Not included in local discovery runs.
+# ═══════════════════════════════════════════════════════════════════════════════
+cat("── CropScape ──\n")
+cat("  [SKIP] National CDL raster is ~10.4GB/year (zip + tif + overview); too large.\n\n")
+results[["CropScape"]] <- list(status = "skipped",
+                                vars   = character(0),
+                                msg    = "~10.4GB/year — too large for local discovery")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Summary
